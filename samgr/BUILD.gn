@@ -1,0 +1,39 @@
+import("//build/ohos.gni")
+
+_ipc = "//foundation/communication/ipc/interfaces/innerkits/ipc_single:ipc_single"
+
+ohos_executable("ipc_test_server") {
+  sources = [ "ipc_test_server.cpp" ]
+  deps = [ _ipc ]
+  external_deps = [
+    "c_utils:utils",
+    "samgr:samgr_proxy",
+  ]
+  install_enable = false
+  part_name = "ipc"
+  subsystem_name = "communication"
+}
+
+ohos_executable("ipc_test_client") {
+  sources = [ "ipc_test_client.cpp" ]
+  deps = [ _ipc ]
+  external_deps = [
+    "c_utils:utils",
+    "samgr:samgr_proxy",
+  ]
+  install_enable = false
+  part_name = "ipc"
+  subsystem_name = "communication"
+}
+
+ohos_executable("samgr_client") {
+  sources = [ "samgr_client.cpp" ]
+  deps = [ _ipc ]
+  external_deps = [
+    "c_utils:utils",
+    "samgr:samgr_proxy",
+  ]
+  install_enable = false
+  part_name = "ipc"
+  subsystem_name = "communication"
+}
