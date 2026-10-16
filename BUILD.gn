@@ -1,0 +1,10 @@
+_tc = "//build/toolchain/ohos:ohos_clang_x86_64"
+
+group("all") {
+  deps = [
+    "//foundation/systemabilitymgr/samgr/services/samgr/native:samgr($_tc)",
+    "samgr:ipc_test_server($_tc)",
+    "samgr:ipc_test_client($_tc)",
+    "samgr:samgr_client($_tc)",
+  ]
+}
