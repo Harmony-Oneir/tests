@@ -223,8 +223,13 @@ void CheckPixel(const std::string &name, const std::shared_ptr<Media::PixelMap> 
         return;
     }
     Rgba c {};
-    if (!PixelAt(pm, x, y, c)) {
+    if (!pm) {
         Report(name, false, "снимок не получен: " + g_captureError);
+        return;
+    }
+    if (!PixelAt(pm, x, y, c)) {
+        Report(name, false, "точка (" + std::to_string(x) + "," + std::to_string(y) + ") вне снимка " +
+               std::to_string(pm->GetWidth()) + "x" + std::to_string(pm->GetHeight()));
         return;
     }
     char want[48];
@@ -242,9 +247,15 @@ std::shared_ptr<RSCanvasNode> NewCanvas(float x, float y, float w, float h, uint
     return node;
 }
 
+// Клиентские узлы RS не принадлежат родителю: окно хранит детей по идентификатору, а деструктор
+// узла отправляет в RS команду удаления. Узлы, созданные в цикле, нужно держать живыми, пока они
+// на экране, — иначе они исчезают в той же транзакции, в которой были добавлены.
+std::vector<std::shared_ptr<RSNode>> g_keepAlive;
+
 void ClearWindow()
 {
     g.window->ClearChildren();
+    g_keepAlive.clear();
     g.window->SetBackgroundColor(Argb(255, 0, 0, 0));
     Flush();
 }
@@ -560,6 +571,33 @@ void TestPerf()
     ClearWindow();
 }
 
+// Диагностика расхождения windows/stress: один узел, меняется по одному параметру —
+// цвет, размер, точка проверки. Каждая вариация в чистом окне.
+void TestSingle()
+{
+    struct V {
+        const char *name;
+        float x, y, w, h;
+        int r, gg, b;
+        int px, py;
+    } vars[] = {
+        {"как окно A: 800x500, красный, точка (200,200)", 100, 100, 800, 500, 220, 40, 40, 200, 200},
+        {"800x500, серый 60, точка (200,200)", 100, 100, 800, 500, 60, 60, 60, 200, 200},
+        {"во весь экран, красный, точка (200,200)", 2, 2, 1916, 1076, 220, 40, 40, 200, 200},
+        {"во весь экран, красный, точка (960,540)", 2, 2, 1916, 1076, 220, 40, 40, 960, 540},
+        {"во весь экран, серый 60, точка (960,540)", 2, 2, 1916, 1076, 60, 60, 60, 960, 540},
+    };
+    for (auto &v : vars) {
+        auto n = NewCanvas(v.x, v.y, v.w, v.h,
+                           Argb(255, static_cast<uint8_t>(v.r), static_cast<uint8_t>(v.gg), static_cast<uint8_t>(v.b)));
+        g.window->AddChild(n, -1);
+        Flush();
+        Hold();
+        CheckPixel(v.name, Capture(), v.px, v.py, v.r, v.gg, v.b);
+        ClearWindow();
+    }
+}
+
 // Цвет ячейки сетки: заметно отличается от чёрного фона при любом размере сетки,
 // чтобы тест не проходил «случайно» на тёмных ячейках и сетку было видно глазами.
 static void CellColor(int c, int r, int &cr, int &cg, int &cb)
@@ -582,6 +620,7 @@ void TestStress()
             auto n = NewCanvas(c * cw + 2, r * ch + 2, cw - 4, ch - 4,
                                Argb(255, static_cast<uint8_t>(cr), static_cast<uint8_t>(cg), static_cast<uint8_t>(cb)));
             g.window->AddChild(n, -1);
+            g_keepAlive.push_back(n);
         }
     }
     Flush();
@@ -591,21 +630,14 @@ void TestStress()
     auto pm = Capture(&lat);
     char note[160];
     snprintf(note, sizeof(note), "%d узлов: создание+Flush %.1f мс, снимок %.1f мс", cols * rows, build, lat);
-    if (g.capture && pm) {
-        Rgba c {};
-        // проверяем ячейку в середине сетки
-        const int pc = cols / 4, pr = rows / 3;
-        int cx = static_cast<int>(pc * cw + cw / 2), cy = static_cast<int>(pr * ch + ch / 2);
-        int er, eg, eb;
-        CellColor(pc, pr, er, eg, eb);
-        bool ok = PixelAt(pm, cx, cy, c) && Near(c, er, eg, eb);
-        char cell[96];
-        snprintf(cell, sizeof(cell), ", ячейка (%d,%d) %s, ожидалось (%d,%d,%d)", pc, pr, Str(c).c_str(),
-                 er, eg, eb);
-        Report("нагрузка: " + std::to_string(cols * rows) + " узлов", ok, std::string(note) + cell);
-    } else {
-        Report("нагрузка: " + std::to_string(cols * rows) + " узлов", !g.capture, note);
-    }
+    const std::string name = "нагрузка: " + std::to_string(cols * rows) + " узлов";
+    Report(name + ", замеры", true, note);
+    // проверяем ячейку в середине сетки — общей проверкой, как в остальных тестах
+    const int pc = cols / 4, pr = rows / 3;
+    int cx = static_cast<int>(pc * cw + cw / 2), cy = static_cast<int>(pr * ch + ch / 2);
+    int er, eg, eb;
+    CellColor(pc, pr, er, eg, eb);
+    CheckPixel(name + ", ячейка (" + std::to_string(pc) + "," + std::to_string(pr) + ")", pm, cx, cy, er, eg, eb);
     ClearWindow();
 }
 
@@ -695,7 +727,7 @@ int main(int argc, char **argv)
     std::map<std::string, std::function<void()>> tests = {
         {"screen", TestScreen}, {"colors", TestColors}, {"windows", TestWindows},
         {"shapes", TestShapes}, {"text", TestText}, {"cpubuffer", TestCpuBuffer},
-        {"vsync", TestVsync}, {"perf", TestPerf}, {"stress", TestStress},
+        {"vsync", TestVsync}, {"perf", TestPerf}, {"stress", TestStress}, {"single", TestSingle},
     };
     const std::vector<std::string> order = {"screen", "colors", "windows", "shapes", "text",
                                             "cpubuffer", "vsync", "perf", "stress"};
