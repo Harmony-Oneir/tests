@@ -40,10 +40,13 @@
 #include "text/font.h"
 #include "text/text_blob.h"
 #include "transaction/rs_interfaces.h"
+#include "transaction/rs_render_interface.h"
 #include "transaction/rs_transaction.h"
 #include "ui/rs_canvas_node.h"
 #include "ui/rs_display_node.h"
 #include "ui/rs_surface_node.h"
+#include "ui/rs_ui_context.h"
+#include "ui/rs_ui_director.h"
 
 using namespace OHOS;
 using namespace OHOS::Rosen;
@@ -59,6 +62,9 @@ struct Ctx {
     bool capture = true;
     std::shared_ptr<RSDisplayNode> display;
     std::shared_ptr<RSSurfaceNode> window;
+    // Снимки в этой версии RS делаются через RSRenderInterface, который выдаёт контекст UI
+    // (RSUIDirector -> RSUIContext -> GetRSRenderInterface), как в демо render_service_client.
+    std::shared_ptr<RSUIDirector> director;
 };
 Ctx g;
 
@@ -129,20 +135,38 @@ private:
     std::shared_ptr<Media::PixelMap> pm_;
 };
 
+std::string g_captureError; // причина последней неудачи снимка — для сообщений
+
 std::shared_ptr<Media::PixelMap> Capture(double *latencyMs = nullptr)
 {
+    g_captureError.clear();
     if (!g.capture) {
         return nullptr;
     }
     usleep(150 * 1000); // дать RS отрисовать последний кадр
     auto cb = std::make_shared<CaptureCb>();
     auto t0 = Clock::now();
-    if (!RSInterfaces::GetInstance().TakeSurfaceCapture(g.display, cb)) {
+    // В этой версии RS снимки в RSInterfaces — заглушки (return false); реализация перенесена
+    // в RSRenderInterface (rs_render_interface.cpp), его выдаёт контекст UI. Снимаем весь экран.
+    auto ctx = g.director ? g.director->GetRSUIContext() : nullptr;
+    auto ri = ctx ? ctx->GetRSRenderInterface() : nullptr;
+    if (!ri) {
+        g_captureError = "нет RSRenderInterface (контекст UI не создан)";
+        return nullptr;
+    }
+    // Снимок окна, а не узла экрана: клиентский RSDisplayNode в этой версии RS — логический узел
+    // без размеров (RS создаёт настоящий узел экрана сам), и снимок по нему получается 0x0.
+    // Окно занимает весь экран с (0,0) и содержит всё тестовое дерево.
+    if (!ri->TakeSurfaceCapture(g.window, cb)) {
+        g_captureError = "TakeSurfaceCapture вернул false (запрос отклонён)";
         return nullptr;
     }
     auto pm = cb->Wait(3000);
     if (latencyMs) {
         *latencyMs = MsSince(t0);
+    }
+    if (!pm) {
+        g_captureError = "запрос принят, но снимок пустой или нет ответа за 3 с (см. hilog: Capture)";
     }
     return pm;
 }
@@ -189,7 +213,7 @@ void CheckPixel(const std::string &name, const std::shared_ptr<Media::PixelMap> 
     }
     Rgba c {};
     if (!PixelAt(pm, x, y, c)) {
-        Report(name, false, "снимок не получен");
+        Report(name, false, "снимок не получен: " + g_captureError);
         return;
     }
     char want[48];
@@ -353,7 +377,7 @@ void TestText()
     if (!g.capture) {
         Report("текст", true, "без снимка — проверьте глазами");
     } else if (!pm) {
-        Report("текст", false, "снимок не получен");
+        Report("текст", false, "снимок не получен: " + g_captureError);
     } else {
         // в полосе самого крупного текста должны быть светлые пиксели
         int lit = 0;
@@ -548,6 +572,16 @@ bool Setup()
         printf("RS не вернул экран по умолчанию — RS запущен?\n");
         return false;
     }
+    // Контекст UI с соединением к процессу рендеринга — так же, как в демо render_service_client
+    // (render_service_client_surface_capture_errcode_demo.cpp): через него работают снимки экрана.
+    auto connectToRender = rs.GetConnectToRenderToken(g.screen);
+    g.director = RSUIDirector::Create(connectToRender);
+    if (!g.director || !g.director->GetRSUIContext()) {
+        printf("контекст UI не создан — снимки экрана работать не будут\n");
+    } else {
+        g.director->SendMessages();
+    }
+
     auto mode = rs.GetScreenActiveMode(g.screen);
     g.width = mode.GetScreenWidth();
     g.height = mode.GetScreenHeight();
@@ -559,6 +593,10 @@ bool Setup()
     RSDisplayNodeConfig dcfg;
     dcfg.screenId = g.screen;
     g.display = RSDisplayNode::Create(dcfg);
+    if (g.display) {
+        g.display->SetBounds(0, 0, g.width, g.height);
+        g.display->SetFrame(0, 0, g.width, g.height);
+    }
 
     RSSurfaceNodeConfig wcfg;
     wcfg.SurfaceNodeName = "rs_probe_window";
