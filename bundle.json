@@ -1,0 +1,36 @@
+{
+  "name": "@oneir/oneir_tests",
+  "description": "Тестовые программы Oneir (графика: rs_probe)",
+  "version": "1.0",
+  "license": "Apache License 2.0",
+  "segment": {
+    "destPath": "oneir/tests"
+  },
+  "component": {
+    "name": "oneir_tests",
+    "subsystem": "oneir",
+    "syscap": [],
+    "features": [],
+    "adapted_system_type": [ "standard" ],
+    "rom": "",
+    "ram": "",
+    "deps": {
+      "components": [
+        "c_utils",
+        "eventhandler",
+        "graphic_2d",
+        "graphic_surface",
+        "hilog",
+        "image_framework"
+      ],
+      "third_party": []
+    },
+    "build": {
+      "sub_component": [
+        "//oneir/tests/graphics:graphics_tests"
+      ],
+      "inner_kits": [],
+      "test": []
+    }
+  }
+}
