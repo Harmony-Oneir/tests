@@ -4,7 +4,7 @@
  *
  * rs_probe — проверка Render Service (RS) клиентом.
  *
- * Строит дерево узлов RSDisplayNode (экран) -> RSSurfaceNode (окно) -> RSCanvasNode (содержимое),
+ * Строит дерево узлов: окно (RSSurfaceNode, прикреплено к экрану) -> RSCanvasNode (содержимое),
  * рисует разными способами и проверяет результат снимком экрана (TakeSurfaceCapture):
  * так видно, что RS действительно отрисовал кадр, а не только принял команды.
  *
@@ -14,6 +14,8 @@
  *
  * Опции:  --hold <с>  сколько держать каждую картинку на экране (по умолчанию 1)
  *         --grid N    stress: сетка N x N узлов (по умолчанию 20)
+ *         --attach-to-display  прикреплять окно через AttachToDisplay вместо RSDisplayNode
+ *                     (на стенде без службы дисплеев RS при этом рисует, но не выводит на экран)
  *         --no-capture  не делать снимков (только вывод на экран)
  */
 
@@ -62,6 +64,9 @@ struct Ctx {
     int holdSec = 1;
     bool capture = true;
     int grid = 20;          // stress: сетка grid x grid узлов (--grid N)
+    // Окно крепится к экрану через клиентский RSDisplayNode: только при нём RS выводит кадры на дисплей
+    // (проверено: 21 коммит композитора против 0 при AttachToDisplay). --attach-to-display — для сравнения.
+    bool useDisplayNode = true;
     std::shared_ptr<RSDisplayNode> display;
     std::shared_ptr<RSSurfaceNode> window;
     // Снимки в этой версии RS делаются через RSRenderInterface, который выдаёт контекст UI
@@ -92,6 +97,10 @@ double MsSince(Clock::time_point t0)
 void Flush()
 {
     RSTransaction::FlushImplicitTransaction();
+    // Команды узлов, привязанных к контексту UI, отправляет его директор.
+    if (g.director) {
+        g.director->SendMessages();
+    }
 }
 
 void Hold()
@@ -551,6 +560,15 @@ void TestPerf()
     ClearWindow();
 }
 
+// Цвет ячейки сетки: заметно отличается от чёрного фона при любом размере сетки,
+// чтобы тест не проходил «случайно» на тёмных ячейках и сетку было видно глазами.
+static void CellColor(int c, int r, int &cr, int &cg, int &cb)
+{
+    cr = 60 + (c * 37) % 190;
+    cg = 60 + (r * 53) % 190;
+    cb = 60 + ((c + r) * 29) % 190;
+}
+
 void TestStress()
 {
     // много узлов: сетка grid x grid цветных прямоугольников (по умолчанию 20x20 = 400)
@@ -559,8 +577,10 @@ void TestStress()
     auto t0 = Clock::now();
     for (int r = 0; r < rows; r++) {
         for (int c = 0; c < cols; c++) {
+            int cr, cg, cb;
+            CellColor(c, r, cr, cg, cb);
             auto n = NewCanvas(c * cw + 2, r * ch + 2, cw - 4, ch - 4,
-                               Argb(255, (c * 13) & 255, (r * 13) & 255, ((r + c) * 7) & 255));
+                               Argb(255, static_cast<uint8_t>(cr), static_cast<uint8_t>(cg), static_cast<uint8_t>(cb)));
             g.window->AddChild(n, -1);
         }
     }
@@ -576,10 +596,12 @@ void TestStress()
         // проверяем ячейку в середине сетки
         const int pc = cols / 4, pr = rows / 3;
         int cx = static_cast<int>(pc * cw + cw / 2), cy = static_cast<int>(pr * ch + ch / 2);
-        bool ok = PixelAt(pm, cx, cy, c) && Near(c, (pc * 13) & 255, (pr * 13) & 255, ((pr + pc) * 7) & 255);
+        int er, eg, eb;
+        CellColor(pc, pr, er, eg, eb);
+        bool ok = PixelAt(pm, cx, cy, c) && Near(c, er, eg, eb);
         char cell[96];
         snprintf(cell, sizeof(cell), ", ячейка (%d,%d) %s, ожидалось (%d,%d,%d)", pc, pr, Str(c).c_str(),
-                 (pc * 13) & 255, (pr * 13) & 255, ((pr + pc) * 7) & 255);
+                 er, eg, eb);
         Report("нагрузка: " + std::to_string(cols * rows) + " узлов", ok, std::string(note) + cell);
     } else {
         Report("нагрузка: " + std::to_string(cols * rows) + " узлов", !g.capture, note);
@@ -616,25 +638,37 @@ bool Setup()
         g.height = 1080;
     }
 
-    RSDisplayNodeConfig dcfg;
-    dcfg.screenId = g.screen;
-    g.display = RSDisplayNode::Create(dcfg);
-    if (g.display) {
-        g.display->SetBounds(0, 0, g.width, g.height);
-        g.display->SetFrame(0, 0, g.width, g.height);
-    }
-
     RSSurfaceNodeConfig wcfg;
     wcfg.SurfaceNodeName = "rs_probe_window";
     g.window = RSSurfaceNode::Create(wcfg, RSSurfaceNodeType::APP_WINDOW_NODE);
-    if (!g.display || !g.window) {
-        printf("не удалось создать узлы экрана/окна\n");
+    if (!g.window) {
+        printf("не удалось создать окно\n");
         return false;
     }
     g.window->SetBounds(0, 0, g.width, g.height);
     g.window->SetFrame(0, 0, g.width, g.height);
     g.window->SetBackgroundColor(Argb(255, 0, 0, 0));
-    g.display->AddChild(g.window, -1);
+
+    if (g.useDisplayNode) {
+        // клиентский узел экрана -> окно: RS выводит кадры на дисплей
+        RSDisplayNodeConfig dcfg;
+        dcfg.screenId = g.screen;
+        g.display = RSDisplayNode::Create(dcfg);
+        if (!g.display) {
+            printf("не удалось создать узел экрана\n");
+            return false;
+        }
+        g.display->SetBounds(0, 0, g.width, g.height);
+        g.display->SetFrame(0, 0, g.width, g.height);
+        g.display->AddChild(g.window, -1);
+    } else {
+        // как в демо render_service_client: окно прикрепляется к экрану напрямую. На стенде RS
+        // при этом рисует окно (снимки верны), но не выводит его на дисплей: 0 коммитов композитора.
+        g.window->AttachToDisplay(g.screen);
+    }
+    if (g.director) {
+        g.director->SetRSSurfaceNode(g.window);
+    }
     Flush();
     printf("экран %llu, %dx%d; узел экрана и окно созданы\n",
            static_cast<unsigned long long>(g.screen), g.width, g.height);
@@ -646,8 +680,10 @@ void Teardown()
 {
     if (g.display) {
         g.display->RemoveFromTree();
-        Flush();
+    } else if (g.window) {
+        g.window->RemoveFromTree();
     }
+    Flush();
     if (g_receiver) {
         g_receiver.reset();
     }
@@ -667,7 +703,7 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "-h" || a == "--help") {
-            printf("rs_probe [--hold <с>] [--grid N] [--no-capture] [тест ...]\nтесты:");
+            printf("rs_probe [--hold <с>] [--grid N] [--attach-to-display] [--no-capture] [тест ...]\nтесты:");
             for (auto &t : order) printf(" %s", t.c_str());
             printf("\n");
             return 0;
@@ -675,6 +711,8 @@ int main(int argc, char **argv)
             g.holdSec = std::max(0, atoi(argv[++i]));
         } else if (a == "--grid" && i + 1 < argc) {
             g.grid = std::max(1, std::min(60, atoi(argv[++i])));
+        } else if (a == "--attach-to-display") {
+            g.useDisplayNode = false;
         } else if (a == "--no-capture") {
             g.capture = false;
         } else if (tests.count(a)) {
