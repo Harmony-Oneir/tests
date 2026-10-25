@@ -1,0 +1,25 @@
+# Copyright (c) 2026 Harmony-Oneir
+# Тестовые программы графики Oneir.
+import("//build/ohos.gni")
+
+ohos_executable("rs_probe") {
+  sources = [ "rs_probe.cpp" ]
+  cflags_cc = [ "-Wno-unused-function" ]
+  external_deps = [
+    "c_utils:utils",
+    "eventhandler:libeventhandler",
+    "graphic_2d:2d_graphics",
+    "graphic_2d:librender_service_base",
+    "graphic_2d:librender_service_client",
+    "graphic_surface:surface",
+    "hilog:libhilog",
+    "image_framework:image_native",
+  ]
+  install_enable = true
+  part_name = "oneir_tests"
+  subsystem_name = "oneir"
+}
+
+group("graphics_tests") {
+  deps = [ ":rs_probe" ]
+}
