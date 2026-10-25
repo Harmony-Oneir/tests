@@ -110,8 +110,8 @@ public:
         done_ = true;
         cv_.notify_all();
     }
-    // В новых версиях RS есть ещё HDR-вариант; без override — собирается с обеими версиями.
-    void OnSurfaceCaptureHDR(std::shared_ptr<Media::PixelMap> pixelmap, std::shared_ptr<Media::PixelMap>)
+    // HDR-вариант снимка (есть в этой версии RS): берём обычную часть.
+    void OnSurfaceCaptureHDR(std::shared_ptr<Media::PixelMap> pixelmap, std::shared_ptr<Media::PixelMap>) override
     {
         OnSurfaceCapture(pixelmap);
     }
