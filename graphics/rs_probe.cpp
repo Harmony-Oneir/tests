@@ -13,6 +13,7 @@
  *   rs_probe -h             — список
  *
  * Опции:  --hold <с>  сколько держать каждую картинку на экране (по умолчанию 1)
+ *         --grid N    stress: сетка N x N узлов (по умолчанию 20)
  *         --no-capture  не делать снимков (только вывод на экран)
  */
 
@@ -60,6 +61,7 @@ struct Ctx {
     int height = 0;
     int holdSec = 1;
     bool capture = true;
+    int grid = 20;          // stress: сетка grid x grid узлов (--grid N)
     std::shared_ptr<RSDisplayNode> display;
     std::shared_ptr<RSSurfaceNode> window;
     // Снимки в этой версии RS делаются через RSRenderInterface, который выдаёт контекст UI
@@ -462,13 +464,30 @@ void OnVsync(int64_t ts, void *)
     g_receiver->RequestNextVSync(g_fcb);
 }
 
-void TestVsync()
+std::string g_vsyncError;
+
+// Приёмник VSync создаётся в Setup() ДО контекста UI (RSUIDirector): после создания
+// контекста с соединением к процессу рендеринга CreateVSyncReceiver возвращает nullptr.
+void CreateVsyncReceiver()
 {
-    auto runner = AppExecFwk::EventRunner::Create(true);
+    static std::shared_ptr<AppExecFwk::EventRunner> runner = AppExecFwk::EventRunner::Create(true);
     auto handler = std::make_shared<AppExecFwk::EventHandler>(runner);
     g_receiver = RSInterfaces::GetInstance().CreateVSyncReceiver("rs_probe", handler);
-    if (!g_receiver || g_receiver->Init() != 0) {
-        Report("VSync: приёмник", false);
+    if (!g_receiver) {
+        g_vsyncError = "CreateVSyncReceiver вернул nullptr";
+        return;
+    }
+    int initRet = g_receiver->Init();
+    if (initRet != 0) {
+        g_vsyncError = "Init() = " + std::to_string(initRet);
+        g_receiver.reset();
+    }
+}
+
+void TestVsync()
+{
+    if (!g_receiver) {
+        Report("VSync: приёмник", false, g_vsyncError);
         return;
     }
     g_fcb.userData_ = nullptr;
@@ -534,8 +553,8 @@ void TestPerf()
 
 void TestStress()
 {
-    // много узлов: сетка 20x20 = 400 цветных прямоугольников
-    const int cols = 20, rows = 20;
+    // много узлов: сетка grid x grid цветных прямоугольников (по умолчанию 20x20 = 400)
+    const int cols = g.grid, rows = g.grid;
     float cw = static_cast<float>(g.width) / cols, ch = static_cast<float>(g.height) / rows;
     auto t0 = Clock::now();
     for (int r = 0; r < rows; r++) {
@@ -551,14 +570,19 @@ void TestStress()
     double lat = 0;
     auto pm = Capture(&lat);
     char note[160];
-    snprintf(note, sizeof(note), "400 узлов: создание+Flush %.1f мс, снимок %.1f мс", build, lat);
+    snprintf(note, sizeof(note), "%d узлов: создание+Flush %.1f мс, снимок %.1f мс", cols * rows, build, lat);
     if (g.capture && pm) {
         Rgba c {};
-        int cx = static_cast<int>(5 * cw + cw / 2), cy = static_cast<int>(7 * ch + ch / 2);
-        bool ok = PixelAt(pm, cx, cy, c) && Near(c, (5 * 13) & 255, (7 * 13) & 255, ((7 + 5) * 7) & 255);
-        Report("нагрузка: 400 узлов", ok, std::string(note) + ", ячейка (5,7) " + Str(c));
+        // проверяем ячейку в середине сетки
+        const int pc = cols / 4, pr = rows / 3;
+        int cx = static_cast<int>(pc * cw + cw / 2), cy = static_cast<int>(pr * ch + ch / 2);
+        bool ok = PixelAt(pm, cx, cy, c) && Near(c, (pc * 13) & 255, (pr * 13) & 255, ((pr + pc) * 7) & 255);
+        char cell[96];
+        snprintf(cell, sizeof(cell), ", ячейка (%d,%d) %s, ожидалось (%d,%d,%d)", pc, pr, Str(c).c_str(),
+                 (pc * 13) & 255, (pr * 13) & 255, ((pr + pc) * 7) & 255);
+        Report("нагрузка: " + std::to_string(cols * rows) + " узлов", ok, std::string(note) + cell);
     } else {
-        Report("нагрузка: 400 узлов", !g.capture, note);
+        Report("нагрузка: " + std::to_string(cols * rows) + " узлов", !g.capture, note);
     }
     ClearWindow();
 }
@@ -572,6 +596,8 @@ bool Setup()
         printf("RS не вернул экран по умолчанию — RS запущен?\n");
         return false;
     }
+    CreateVsyncReceiver(); // до контекста UI — см. комментарий у функции
+
     // Контекст UI с соединением к процессу рендеринга — так же, как в демо render_service_client
     // (render_service_client_surface_capture_errcode_demo.cpp): через него работают снимки экрана.
     auto connectToRender = rs.GetConnectToRenderToken(g.screen);
@@ -641,12 +667,14 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "-h" || a == "--help") {
-            printf("rs_probe [--hold <с>] [--no-capture] [тест ...]\nтесты:");
+            printf("rs_probe [--hold <с>] [--grid N] [--no-capture] [тест ...]\nтесты:");
             for (auto &t : order) printf(" %s", t.c_str());
             printf("\n");
             return 0;
         } else if (a == "--hold" && i + 1 < argc) {
             g.holdSec = std::max(0, atoi(argv[++i]));
+        } else if (a == "--grid" && i + 1 < argc) {
+            g.grid = std::max(1, std::min(60, atoi(argv[++i])));
         } else if (a == "--no-capture") {
             g.capture = false;
         } else if (tests.count(a)) {
