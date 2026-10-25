@@ -37,3 +37,13 @@ sudo VK_ICD_FILENAMES=/system/etc/vulkan/icd.d/intel_icd.x86_64.json \
 | stress |	400 узлов-прямоугольников: время создания и отправки, задержка снимка, сверка одной из ячеек |
 
 Сравнение shapes/colors и cpubuffer как раз покажет, где у вас обрывается цепочка: в рендеринге RS на GPU или в пути готовых буферов к экрану.
+
+## Сборка
+Для сборки тестов выполните команду `./make.sh --reload //oneir/tests/graphics:graphics_tests` в контейнере. Результат компиляции находится по пути `out/oneir/oneir/oneir_tests/rs_probe`. 
+
+Запуск следующими командами:
+```bash
+sudo VK_ICD_FILENAMES=/system/etc/vulkan/icd.d/intel_icd.x86_64.json ./rs_probe            # все тесты
+sudo VK_ICD_FILENAMES=/system/etc/vulkan/icd.d/intel_icd.x86_64.json ./rs_probe colors --hold 3
+./rs_probe -h
+```
