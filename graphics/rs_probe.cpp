@@ -38,6 +38,7 @@
 #include "event_handler.h"
 #include "pixel_map.h"
 #include "pipeline/rs_recording_canvas.h"
+#include "render/rs_filter.h"
 #include "surface_utils.h"
 #include "draw/brush.h"
 #include "draw/color.h"
@@ -870,7 +871,8 @@ void TestBlur()
     CheckPixel("без размытия: справа от границы синий", pm, mid + 6, 300, 0, 0, 255);
 
     auto blur = NewCanvas(static_cast<float>(mid - 200), 200, 400, 300, 0x00000000);
-    blur->SetBackgroundBlurRadius(40.0f);
+    // SetBackgroundBlurRadius в этой версии закрытый; публичный путь — фильтр фона
+    blur->SetBackgroundFilter(RSFilter::CreateBlurFilter(40.0f, 40.0f));
     blur->SetPositionZ(1);
     g.window->AddChild(blur, -1);
     Flush();
