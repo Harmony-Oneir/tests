@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -61,6 +62,7 @@ struct Ctx {
     ScreenId screen = INVALID_SCREEN_ID;
     int width = 0;
     int height = 0;
+    uint32_t refresh = 60;  // частота активного режима экрана, Гц
     int holdSec = 1;
     bool capture = true;
     int grid = 20;          // stress: сетка grid x grid узлов (--grid N)
@@ -473,6 +475,7 @@ std::vector<int64_t> g_vsyncTs;
 std::mutex g_vsyncMu;
 std::shared_ptr<VSyncReceiver> g_receiver;
 VSyncReceiver::FrameCallback g_fcb;
+std::atomic<bool> g_vsyncRunning {false};
 
 void OnVsync(int64_t ts, void *)
 {
@@ -481,7 +484,41 @@ void OnVsync(int64_t ts, void *)
         g_vsyncTs.push_back(ts);
     }
     g_vsyncCount++;
-    g_receiver->RequestNextVSync(g_fcb);
+    if (g_vsyncRunning) {
+        g_receiver->RequestNextVSync(g_fcb);
+    }
+}
+
+// Статистика интервалов между отметками времени VSync (нс): средний период, максимум,
+// число пропусков (интервал больше полутора средних — значит, сигнал не пришёл вовремя).
+struct IntervalStats {
+    double avgMs = 0, maxMs = 0, maxDevMs = 0;
+    int missed = 0;
+};
+
+IntervalStats Intervals(const std::vector<int64_t> &ts, double nominalMs)
+{
+    IntervalStats st;
+    if (ts.size() < 3) {
+        return st;
+    }
+    std::vector<double> d;
+    for (size_t i = 1; i < ts.size(); i++) {
+        d.push_back((ts[i] - ts[i - 1]) / 1e6);
+    }
+    for (double v : d) {
+        st.avgMs += v;
+        st.maxMs = std::max(st.maxMs, v);
+    }
+    st.avgMs /= d.size();
+    const double ref = nominalMs > 0 ? nominalMs : st.avgMs;
+    for (double v : d) {
+        st.maxDevMs = std::max(st.maxDevMs, std::abs(v - st.avgMs));
+        if (v > ref * 1.5) {
+            st.missed++;
+        }
+    }
+    return st;
 }
 
 std::string g_vsyncError;
@@ -514,8 +551,11 @@ void TestVsync()
     g_fcb.callback_ = OnVsync;
     g_vsyncTs.clear();
     g_vsyncCount = 0;
+    g_vsyncRunning = true;
     g_receiver->RequestNextVSync(g_fcb);
     sleep(2);
+    g_vsyncRunning = false;
+    usleep(50 * 1000); // дать последнему обратному вызову завершиться
     int n = g_vsyncCount.load();
     double avg = 0;
     double jitter = 0;
@@ -537,29 +577,86 @@ void TestVsync()
     Report("VSync", n > 30, note);
 }
 
-void TestPerf()
-{
-    // 1. время отправки транзакции и частота кадров при движении узла
-    auto node = NewCanvas(0, 400, 200, 200, Argb(255, 255, 160, 0));
-    g.window->AddChild(node, -1);
-    Flush();
-    const int frames = 240;
+// Анимация по VSync: каждый сигнал — ровно один шаг квадрата и одна транзакция, как в
+// настоящем приложении. Так рывки самого теста исключены, и остаются только рывки вывода.
+struct AnimState {
+    std::shared_ptr<RSCanvasNode> node;
+    int frame = 0;
+    int frames = 240;
+    float step = 8.0f;
+    std::vector<int64_t> ts;
     double flushMax = 0;
-    auto t0 = Clock::now();
-    for (int i = 0; i < frames; i++) {
-        float x = static_cast<float>((i * 7) % (g.width - 200));
-        node->SetBounds(x, 400, 200, 200);
-        node->SetFrame(x, 400, 200, 200);
+    bool done = false;
+    std::mutex mu;
+    std::condition_variable cv;
+};
+AnimState *g_anim = nullptr;
+VSyncReceiver::FrameCallback g_animFcb;
+
+void OnAnimVsync(int64_t ts, void *)
+{
+    AnimState &a = *g_anim;
+    bool finished = false;
+    {
+        std::lock_guard<std::mutex> lock(a.mu);
+        a.ts.push_back(ts);
+        // «пинг-понг» между краями экрана: движение без скачка в начало
+        const float span = static_cast<float>(g.width - 200);
+        float pos = std::fmod(a.frame * a.step, 2 * span);
+        float x = pos <= span ? pos : 2 * span - pos;
+        a.node->SetBounds(x, 400, 200, 200);
+        a.node->SetFrame(x, 400, 200, 200);
         auto tf = Clock::now();
         Flush();
-        flushMax = std::max(flushMax, MsSince(tf));
-        usleep(16666);
+        a.flushMax = std::max(a.flushMax, MsSince(tf));
+        a.frame++;
+        finished = a.frame >= a.frames;
+        a.done = finished;
     }
-    double total = MsSince(t0);
-    char note[160];
-    snprintf(note, sizeof(note), "%d кадров за %.0f мс (%.1f к/с), макс. время Flush %.2f мс",
-             frames, total, frames * 1000.0 / total, flushMax);
-    Report("анимация перемещением", true, note);
+    if (finished) {
+        a.cv.notify_all();
+    } else {
+        g_receiver->RequestNextVSync(g_animFcb);
+    }
+}
+
+void TestPerf()
+{
+    char note[512]; // кириллица — 2 байта на символ
+    if (!g_receiver) {
+        Report("анимация по VSync", false, "нет приёмника VSync: " + g_vsyncError);
+    } else {
+        AnimState a;
+        a.node = NewCanvas(0, 400, 200, 200, Argb(255, 255, 160, 0));
+        g.window->AddChild(a.node, -1);
+        Flush();
+        usleep(100 * 1000);
+
+        g_anim = &a;
+        g_animFcb.userData_ = nullptr;
+        g_animFcb.callback_ = OnAnimVsync;
+        auto t0 = Clock::now();
+        g_receiver->RequestNextVSync(g_animFcb);
+        {
+            std::unique_lock<std::mutex> lock(a.mu);
+            a.cv.wait_for(lock, std::chrono::seconds(10), [&a] { return a.done; });
+        }
+        double total = MsSince(t0);
+        bool completed;
+        IntervalStats st;
+        {
+            std::lock_guard<std::mutex> lock(a.mu);
+            completed = a.done;
+            st = Intervals(a.ts, 1000.0 / g.refresh);
+        }
+        g_anim = nullptr;
+        snprintf(note, sizeof(note),
+                 "%d шагов за %.0f мс (%.1f к/с); VSync: период %.2f мс (экран %u Гц = %.2f мс), "
+                 "макс. интервал %.2f мс, пропусков %d; макс. Flush %.2f мс",
+                 a.frame, total, a.frame * 1000.0 / total, st.avgMs, g.refresh, 1000.0 / g.refresh,
+                 st.maxMs, st.missed, a.flushMax);
+        Report("анимация по VSync", completed && st.missed == 0, note);
+    }
 
     // 2. задержка снимка экрана (полный кадр с GPU в память)
     if (g.capture) {
@@ -652,10 +749,12 @@ bool Setup()
     }
     CreateVsyncReceiver(); // до контекста UI — см. комментарий у функции
 
-    // Контекст UI с соединением к процессу рендеринга — так же, как в демо render_service_client
-    // (render_service_client_surface_capture_errcode_demo.cpp): через него работают снимки экрана.
-    auto connectToRender = rs.GetConnectToRenderToken(g.screen);
-    g.director = RSUIDirector::Create(connectToRender);
+    // Контекст UI — через него в версии 7 доступен RSRenderInterface (снимки экрана).
+    // Создаётся без токена процесса рендеринга, как у оконного менеджера и ArkUI
+    // (RSUIDirector::Create(nullptr)): в однопроцессном режиме RS контекст работает через
+    // соединение по умолчанию. Токен (GetConnectToRenderToken) нужен только для отдельного
+    // процесса рендеринга многопроцессного режима; с ним клиент получал «hasRemoteObj err».
+    g.director = RSUIDirector::Create(nullptr);
     if (!g.director || !g.director->GetRSUIContext()) {
         printf("контекст UI не создан — снимки экрана работать не будут\n");
     } else {
@@ -665,6 +764,9 @@ bool Setup()
     auto mode = rs.GetScreenActiveMode(g.screen);
     g.width = mode.GetScreenWidth();
     g.height = mode.GetScreenHeight();
+    if (mode.GetScreenRefreshRate() > 0) {
+        g.refresh = mode.GetScreenRefreshRate();
+    }
     if (g.width <= 0 || g.height <= 0) {
         g.width = 1920;
         g.height = 1080;
