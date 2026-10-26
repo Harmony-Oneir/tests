@@ -816,6 +816,7 @@ void TestDecor()
 
     // граница 20 px красная вокруг зелёного узла
     auto b = NewCanvas(200, 200, 400, 300, Argb(255, 40, 180, 40));
+    b->SetBorderStyle(0u); // BorderStyle::SOLID — без явного стиля граница не рисуется
     b->SetBorderWidth(20.0f);
     b->SetBorderColor(Argb(255, 220, 30, 30));
     g.window->AddChild(b, -1);
@@ -934,9 +935,21 @@ void TestImage()
 }
 
 // Неявная анимация на стороне RS: клиент задаёт конечное значение, промежуточные кадры считает RS.
+void RequestUiFrame(); // определена в разделе «кадровый цикл UI клиента»
+
 void TestAnimation()
 {
+    auto ctx = g.director ? g.director->GetRSUIContext() : nullptr;
+    if (!ctx) {
+        Report("анимация RS: контекст UI", false, "нет контекста — RSNode::Animate требует RSUIContext");
+        return;
+    }
     auto n = NewCanvas(100, 440, 200, 200, Argb(255, 255, 160, 0));
+    n->SetRSUIContext(ctx); // свойства узла должны попадать в аниматор того же контекста
+    // Анимировать можно только существующее свойство: первый SetTranslate внутри Animate
+    // создал бы его без начального значения, и RS применил бы конечное значение сразу,
+    // не создав ни одной анимации. Поэтому свойство создаётся заранее с начальным значением.
+    n->SetTranslate(Vector2f(0.0f, 0.0f));
     g.window->AddChild(n, -1);
     Flush();
     usleep(200 * 1000);
@@ -948,7 +961,7 @@ void TestAnimation()
     RSAnimationTimingProtocol protocol;
     protocol.SetDuration(800);
     auto t0 = Clock::now();
-    auto anims = RSNode::Animate(nullptr, protocol, RSAnimationTimingCurve::LINEAR,
+    auto anims = RSNode::Animate(ctx, protocol, RSAnimationTimingCurve::LINEAR,
         [&n]() { n->SetTranslate(Vector2f(1200.0f, 0.0f)); },
         [&]() {
             std::lock_guard<std::mutex> lock(mu);
@@ -957,6 +970,7 @@ void TestAnimation()
             cv.notify_all();
         });
     Flush();
+    RequestUiFrame(); // запустить кадровый цикл UI (повторный запрос подавляется)
     {
         std::unique_lock<std::mutex> lock(mu);
         cv.wait_for(lock, std::chrono::seconds(3), [&] { return finished; });
@@ -989,21 +1003,38 @@ void TestModes()
              orig.GetScreenModeId(), orig.GetScreenRefreshRate(), count, period);
     Report("режимы: исходный", count > 20, note);
 
-    for (auto &m : modes) {
-        if (m.GetScreenModeId() == orig.GetScreenModeId() || m.GetScreenRefreshRate() == 0) {
+    // SetScreenActiveMode принимает ИНДЕКС режима в списке GetScreenSupportedModes, а
+    // GetScreenModeId() — номер режима в композиторе (по логу RS: индекс 0 → HDI modeId 1).
+    int origIndex = -1;
+    // Номер активного режима и номера в списке у нас не согласованы (активный «1» — 60 Гц,
+    // а в списке «1» — 40 Гц), поэтому исходный режим ищем по размеру и частоте.
+    for (size_t i = 0; i < modes.size(); i++) {
+        if (modes[i].GetScreenWidth() == orig.GetScreenWidth() && modes[i].GetScreenHeight() == orig.GetScreenHeight() &&
+            modes[i].GetScreenRefreshRate() == orig.GetScreenRefreshRate()) {
+            origIndex = static_cast<int>(i);
+        }
+    }
+    for (size_t i = 0; i < modes.size(); i++) {
+        auto &m = modes[i];
+        if (static_cast<int>(i) == origIndex || m.GetScreenRefreshRate() == 0) {
             continue;
         }
-        uint32_t ret = rs.SetScreenActiveMode(g.screen, static_cast<uint32_t>(m.GetScreenModeId()));
+        uint32_t ret = rs.SetScreenActiveMode(g.screen, static_cast<uint32_t>(i));
         sleep(1);
         auto now = rs.GetScreenActiveMode(g.screen);
         MeasureVsync(1000, count, period);
         double expect = 1000.0 / m.GetScreenRefreshRate();
-        snprintf(note, sizeof(note), "SetScreenActiveMode=%u, активный %d (%u Гц), VSync период %.2f мс (ожидалось %.2f)",
-                 ret, now.GetScreenModeId(), now.GetScreenRefreshRate(), period, expect);
+        snprintf(note, sizeof(note),
+                 "индекс %zu (modeId %d, %u Гц): SetScreenActiveMode=%u, активный %d (%u Гц), VSync %.2f мс (ожидалось %.2f)",
+                 i, m.GetScreenModeId(), m.GetScreenRefreshRate(), ret, now.GetScreenModeId(),
+                 now.GetScreenRefreshRate(), period, expect);
         Report("режимы: переключение на " + std::to_string(m.GetScreenRefreshRate()) + " Гц",
-               now.GetScreenModeId() == m.GetScreenModeId() && std::abs(period - expect) < 1.5, note);
+               ret == 0 && now.GetScreenRefreshRate() == m.GetScreenRefreshRate() && std::abs(period - expect) < 1.5,
+               note);
     }
-    rs.SetScreenActiveMode(g.screen, static_cast<uint32_t>(orig.GetScreenModeId()));
+    if (origIndex >= 0) {
+        rs.SetScreenActiveMode(g.screen, static_cast<uint32_t>(origIndex));
+    }
     sleep(1);
     MeasureVsync(1000, count, period);
     snprintf(note, sizeof(note), "активный %d, VSync период %.2f мс",
@@ -1019,6 +1050,41 @@ void TestModes()
     MeasureVsync(1000, count, period);
     snprintf(note, sizeof(note), "после включения: VSync %d сигналов за 1 с, период %.2f мс", count, period);
     Report("питание: выключение и включение экрана", count > 20, note);
+}
+
+// ----------------------------------------------------------------------------- кадровый цикл UI клиента
+// Как UI-поток ArkUI (rosen_window.cpp): библиотека RS просит кадр (SetRequestVsyncCallback),
+// клиент запрашивает VSync и на нём продвигает клиентскую часть анимаций (SetTimeStamp →
+// FlushAnimation → FlushModifier → SendMessages). Без этого колбэки завершения анимаций
+// приходили «ступенями» (~600 мс), а не по окончании анимации.
+std::shared_ptr<AppExecFwk::EventRunner> g_uiRunner;
+std::shared_ptr<AppExecFwk::EventHandler> g_uiHandler;
+std::shared_ptr<VSyncReceiver> g_uiReceiver;
+VSyncReceiver::FrameCallback g_uiFcb;
+std::atomic<bool> g_uiFramePending {false};
+std::atomic<int> g_uiFrames {0};
+
+void RequestUiFrame()
+{
+    if (g_uiReceiver && !g_uiFramePending.exchange(true)) {
+        g_uiReceiver->RequestNextVSync(g_uiFcb);
+    }
+}
+
+void OnUiVsync(int64_t ts, void *)
+{
+    g_uiFramePending = false;
+    if (!g.director) {
+        return;
+    }
+    g_uiFrames++;
+    g.director->SetTimeStamp(static_cast<uint64_t>(ts), "rs_probe");
+    bool running = g.director->FlushAnimation(static_cast<uint64_t>(ts));
+    g.director->FlushModifier();
+    g.director->SendMessages();
+    if (running || g.director->HasUIRunningAnimation()) {
+        RequestUiFrame();
+    }
 }
 
 // ----------------------------------------------------------------------------- инициализация
@@ -1041,6 +1107,33 @@ bool Setup()
     if (!g.director || !g.director->GetRSUIContext()) {
         printf("контекст UI не создан — снимки экрана работать не будут\n");
     } else {
+        // Сообщения от RS клиенту (например, завершение анимации) библиотека выполняет не в
+        // IPC-потоке, а через «UI-поток» приложения — исполнитель задач директора. В ArkUI это
+        // цикл UI-потока (rosen_window.cpp, SetUITaskRunner); у нас — отдельный цикл событий.
+        g_uiRunner = AppExecFwk::EventRunner::Create("rs_probe_ui");
+        g_uiHandler = std::make_shared<AppExecFwk::EventHandler>(g_uiRunner);
+        // Как в ArkUI: контекст привязывается к «UI-потоку», а исполнитель задаётся для режима
+        // нескольких контекстов (useMultiInstance = true) — иначе он ставится только глобальный,
+        // а сообщения узлов, привязанных к контексту (анимации), идут через исполнитель контекста.
+        auto ctx = g.director->GetRSUIContext();
+        ctx->AttachFromUI();
+        if (!ctx->HasTaskRunner()) {
+            g.director->SetUITaskRunner(
+                [](const std::function<void()>& task, uint32_t delay) {
+                    g_uiHandler->PostTask(task, static_cast<int64_t>(delay));
+                },
+                0, true);
+        }
+        // кадровый цикл UI: VSync приходит прямо в UI-поток (обработчик g_uiHandler)
+        g_uiReceiver = RSInterfaces::GetInstance().CreateVSyncReceiver("rs_probe_ui", g_uiHandler);
+        if (g_uiReceiver && g_uiReceiver->Init() == 0) {
+            g_uiFcb.userData_ = nullptr;
+            g_uiFcb.callback_ = OnUiVsync;
+            g.director->SetRequestVsyncCallback([]() { RequestUiFrame(); });
+        } else {
+            g_uiReceiver.reset();
+            printf("приёмник VSync для UI не создан — колбэки анимаций будут запаздывать\n");
+        }
         g.director->SendMessages();
     }
 
