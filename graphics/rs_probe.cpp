@@ -9,7 +9,8 @@
  * так видно, что RS действительно отрисовал кадр, а не только принял команды.
  *
  *   rs_probe                — все тесты
- *   rs_probe <тест> ...     — выбранные: screen colors windows shapes text cpubuffer vsync perf stress
+ *   rs_probe <тест> ...     — выбранные: screen colors windows shapes text cpubuffer transform decor
+ *                             blur image animation vsync perf stress; отдельно: single, modes
  *   rs_probe -h             — список
  *
  * Опции:  --hold <с>  сколько держать каждую картинку на экране (по умолчанию 1)
@@ -41,6 +42,11 @@
 #include "draw/brush.h"
 #include "draw/color.h"
 #include "effect/shader_effect.h"
+#include "image/bitmap.h"
+#include "image/image.h"
+#include "utils/sampling_options.h"
+#include "animation/rs_animation_timing_curve.h"
+#include "animation/rs_animation_timing_protocol.h"
 #include "text/font.h"
 #include "text/text_blob.h"
 #include "transaction/rs_interfaces.h"
@@ -738,6 +744,281 @@ void TestStress()
     ClearWindow();
 }
 
+// ----------------------------------------------------------------------------- расширенные тесты RS
+
+// Замер периода VSync за durationMs через приёмник клиента (общий с тестом vsync).
+static bool MeasureVsync(int durationMs, int &count, double &periodMs)
+{
+    count = 0;
+    periodMs = 0;
+    if (!g_receiver) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_vsyncMu);
+        g_vsyncTs.clear();
+    }
+    g_vsyncCount = 0;
+    g_fcb.userData_ = nullptr;
+    g_fcb.callback_ = OnVsync;
+    g_vsyncRunning = true;
+    g_receiver->RequestNextVSync(g_fcb);
+    usleep(static_cast<useconds_t>(durationMs) * 1000);
+    g_vsyncRunning = false;
+    usleep(60 * 1000);
+    std::lock_guard<std::mutex> lock(g_vsyncMu);
+    count = static_cast<int>(g_vsyncTs.size());
+    if (g_vsyncTs.size() > 2) {
+        periodMs = (g_vsyncTs.back() - g_vsyncTs.front()) / 1e6 / (g_vsyncTs.size() - 1);
+    }
+    return count > 2;
+}
+
+// Трансформации узла: поворот, масштаб, сдвиг (точка опоры — центр, по умолчанию).
+void TestTransform()
+{
+    // квадрат 400x400 в центре экрана: x 760..1160, y 340..740, центр (960,540)
+    auto n = NewCanvas(760, 340, 400, 400, Argb(255, 40, 80, 220));
+    n->SetPivot(0.5f, 0.5f);
+    g.window->AddChild(n, -1);
+
+    n->SetRotation(45.0f);
+    Flush();
+    Hold();
+    auto pm = Capture();
+    // повёрнутый квадрат — ромб с полудиагональю ~283: угол исходного квадрата вне его, середина стороны внутри
+    CheckPixel("поворот 45°: угол исходного квадрата — фон", pm, 770, 350, 0, 0, 0);
+    CheckPixel("поворот 45°: точка у середины стороны — квадрат", pm, 960, 350, 40, 80, 220);
+
+    n->SetRotation(0.0f);
+    n->SetScale(0.5f);
+    Flush();
+    Hold();
+    pm = Capture();
+    CheckPixel("масштаб 0.5: край исходного квадрата — фон", pm, 800, 400, 0, 0, 0);
+    CheckPixel("масштаб 0.5: центр — квадрат", pm, 960, 540, 40, 80, 220);
+
+    n->SetScale(1.0f);
+    n->SetTranslate(Vector2f(300.0f, 0.0f));
+    Flush();
+    Hold();
+    pm = Capture();
+    CheckPixel("сдвиг +300: старое место — фон", pm, 900, 540, 0, 0, 0);
+    CheckPixel("сдвиг +300: новое место — квадрат", pm, 1300, 540, 40, 80, 220);
+    ClearWindow();
+}
+
+// Оформление: граница, тень, обрезка дочернего узла по границам родителя. Фон окна белый.
+void TestDecor()
+{
+    g.window->SetBackgroundColor(Argb(255, 255, 255, 255));
+
+    // граница 20 px красная вокруг зелёного узла
+    auto b = NewCanvas(200, 200, 400, 300, Argb(255, 40, 180, 40));
+    b->SetBorderWidth(20.0f);
+    b->SetBorderColor(Argb(255, 220, 30, 30));
+    g.window->AddChild(b, -1);
+
+    // тень: чёрная, радиус 30, смещение (40,40)
+    auto sh = NewCanvas(900, 200, 300, 200, Argb(255, 40, 80, 220));
+    sh->SetShadowColor(Argb(255, 0, 0, 0));
+    sh->SetShadowRadius(30.0f);
+    sh->SetShadowOffset(40.0f, 40.0f);
+    g.window->AddChild(sh, -1);
+
+    // обрезка: родитель 300x200, дочерний узел 600 px шириной выходит за правый край
+    auto parent = NewCanvas(200, 650, 300, 200, Argb(255, 200, 200, 200));
+    parent->SetClipToBounds(true);
+    auto child = NewCanvas(0, 50, 600, 100, Argb(255, 230, 120, 0));
+    parent->AddChild(child, -1);
+    g.window->AddChild(parent, -1);
+    g_keepAlive.push_back(child);
+
+    Flush();
+    Hold();
+    auto pm = Capture();
+    CheckPixel("граница: полоса у края", pm, 210, 350, 220, 30, 30);
+    CheckPixel("граница: внутри узла", pm, 400, 350, 40, 180, 40);
+    CheckPixel("тень: узел", pm, 1050, 300, 40, 80, 220);
+    Rgba c {};
+    if (!g.capture) {
+        Report("тень: справа снизу от узла темнее фона", true, "без снимка — проверьте глазами");
+    } else if (pm && PixelAt(pm, 1225, 425, c)) {
+        Report("тень: справа снизу от узла темнее фона", c.r < 235 && c.g < 235 && c.b < 235,
+               "в (1225,425) " + Str(c) + ", фон (255,255,255)");
+    } else {
+        Report("тень: справа снизу от узла темнее фона", false, "снимок не получен: " + g_captureError);
+    }
+    CheckPixel("обрезка: дочерний внутри родителя", pm, 350, 750, 230, 120, 0);
+    CheckPixel("обрезка: дочерний за краем родителя не виден", pm, 600, 750, 255, 255, 255);
+    ClearWindow();
+}
+
+// Размытие фона: под узлом с blur резкая граница «красное | синее» становится плавной.
+void TestBlur()
+{
+    auto left = NewCanvas(0, 0, static_cast<float>(g.width) / 2, static_cast<float>(g.height), Argb(255, 255, 0, 0));
+    auto right = NewCanvas(static_cast<float>(g.width) / 2, 0, static_cast<float>(g.width) / 2,
+                           static_cast<float>(g.height), Argb(255, 0, 0, 255));
+    g.window->AddChild(left, -1);
+    g.window->AddChild(right, -1);
+    Flush();
+    Hold();
+    auto pm = Capture();
+    const int mid = g.width / 2;
+    CheckPixel("без размытия: слева от границы красный", pm, mid - 6, 300, 255, 0, 0);
+    CheckPixel("без размытия: справа от границы синий", pm, mid + 6, 300, 0, 0, 255);
+
+    auto blur = NewCanvas(static_cast<float>(mid - 200), 200, 400, 300, 0x00000000);
+    blur->SetBackgroundBlurRadius(40.0f);
+    blur->SetPositionZ(1);
+    g.window->AddChild(blur, -1);
+    Flush();
+    Hold();
+    pm = Capture();
+    for (int dx : {-6, 6}) {
+        Rgba c {};
+        std::string name = std::string("с размытием: ") + (dx < 0 ? "слева" : "справа") + " от границы — смесь цветов";
+        if (!g.capture) {
+            Report(name, true, "без снимка — проверьте глазами");
+        } else if (pm && PixelAt(pm, mid + dx, 350, c)) {
+            Report(name, c.r > 40 && c.b > 40, "в (" + std::to_string(mid + dx) + ",350) " + Str(c));
+        } else {
+            Report(name, false, "снимок не получен: " + g_captureError);
+        }
+    }
+    CheckPixel("вне области размытия граница резкая", pm, mid - 6, 800, 255, 0, 0);
+    ClearWindow();
+}
+
+// Изображение: шахматная картинка 64x64 (клетки 32x32), растянутая до 512x512 на (200,200).
+void TestImage()
+{
+    const int sz = 64;
+    Drawing::Bitmap bmp;
+    Drawing::BitmapFormat fmt { Drawing::COLORTYPE_RGBA_8888, Drawing::ALPHATYPE_PREMUL };
+    if (!bmp.Build(sz, sz, fmt)) {
+        Report("изображение: создание bitmap", false);
+        return;
+    }
+    auto *px = static_cast<uint32_t *>(bmp.GetPixels());
+    for (int y = 0; y < sz; y++) {
+        for (int x = 0; x < sz; x++) {
+            bool even = ((x / 32) + (y / 32)) % 2 == 0;
+            // RGBA в памяти, little-endian: 0xAABBGGRR
+            px[y * sz + x] = even ? 0xFF0000FFu : 0xFF00FF00u; // красный : зелёный
+        }
+    }
+    Drawing::Image img;
+    if (!img.BuildFromBitmap(bmp)) {
+        Report("изображение: Image из bitmap", false);
+        return;
+    }
+    auto node = NewCanvas(0, 0, static_cast<float>(g.width), static_cast<float>(g.height), Argb(255, 0, 0, 0));
+    auto canvas = node->BeginRecording(g.width, g.height);
+    Drawing::SamplingOptions sampling(Drawing::FilterMode::LINEAR, Drawing::MipmapMode::NONE);
+    canvas->DrawImageRect(img, Drawing::Rect(0, 0, sz, sz), Drawing::Rect(200, 200, 712, 712), sampling);
+    node->FinishRecording();
+    g.window->AddChild(node, -1);
+    Flush();
+    Hold();
+    auto pm = Capture();
+    CheckPixel("изображение: левая верхняя клетка", pm, 328, 328, 255, 0, 0);
+    CheckPixel("изображение: правая верхняя клетка", pm, 584, 328, 0, 255, 0);
+    CheckPixel("изображение: левая нижняя клетка", pm, 328, 584, 0, 255, 0);
+    CheckPixel("изображение: правая нижняя клетка", pm, 584, 584, 255, 0, 0);
+    CheckPixel("изображение: вне картинки — фон", pm, 800, 400, 0, 0, 0);
+    ClearWindow();
+}
+
+// Неявная анимация на стороне RS: клиент задаёт конечное значение, промежуточные кадры считает RS.
+void TestAnimation()
+{
+    auto n = NewCanvas(100, 440, 200, 200, Argb(255, 255, 160, 0));
+    g.window->AddChild(n, -1);
+    Flush();
+    usleep(200 * 1000);
+
+    std::mutex mu;
+    std::condition_variable cv;
+    bool finished = false;
+    double finishMs = -1;
+    RSAnimationTimingProtocol protocol;
+    protocol.SetDuration(800);
+    auto t0 = Clock::now();
+    auto anims = RSNode::Animate(nullptr, protocol, RSAnimationTimingCurve::LINEAR,
+        [&n]() { n->SetTranslate(Vector2f(1200.0f, 0.0f)); },
+        [&]() {
+            std::lock_guard<std::mutex> lock(mu);
+            finished = true;
+            finishMs = MsSince(t0);
+            cv.notify_all();
+        });
+    Flush();
+    {
+        std::unique_lock<std::mutex> lock(mu);
+        cv.wait_for(lock, std::chrono::seconds(3), [&] { return finished; });
+    }
+    char note[400]; // кириллица — 2 байта на символ
+    snprintf(note, sizeof(note), "анимаций создано %zu, колбэк завершения %s", anims.size(),
+             finished ? (std::to_string(static_cast<int>(finishMs)) + " мс (задано 800)").c_str() : "не вызван за 3 с");
+    Report("анимация RS: создана и завершилась", !anims.empty() && finished, note);
+    if (finished) {
+        Report("анимация RS: длительность близка к заданной", finishMs > 600 && finishMs < 1500, note);
+    }
+    usleep(200 * 1000);
+    auto pm = Capture();
+    CheckPixel("анимация RS: квадрат в конечной точке", pm, 1400, 540, 255, 160, 0);
+    CheckPixel("анимация RS: в начальной точке — фон", pm, 200, 540, 0, 0, 0);
+    ClearWindow();
+}
+
+// Режимы экрана и питание (меняет состояние оборудования — в общий прогон не входит).
+void TestModes()
+{
+    auto &rs = RSInterfaces::GetInstance();
+    auto modes = rs.GetScreenSupportedModes(g.screen);
+    auto orig = rs.GetScreenActiveMode(g.screen);
+    int count = 0;
+    double period = 0;
+    MeasureVsync(1000, count, period);
+    char note[400]; // кириллица — 2 байта на символ
+    snprintf(note, sizeof(note), "режим %d (%u Гц): VSync %d сигналов за 1 с, период %.2f мс",
+             orig.GetScreenModeId(), orig.GetScreenRefreshRate(), count, period);
+    Report("режимы: исходный", count > 20, note);
+
+    for (auto &m : modes) {
+        if (m.GetScreenModeId() == orig.GetScreenModeId() || m.GetScreenRefreshRate() == 0) {
+            continue;
+        }
+        uint32_t ret = rs.SetScreenActiveMode(g.screen, static_cast<uint32_t>(m.GetScreenModeId()));
+        sleep(1);
+        auto now = rs.GetScreenActiveMode(g.screen);
+        MeasureVsync(1000, count, period);
+        double expect = 1000.0 / m.GetScreenRefreshRate();
+        snprintf(note, sizeof(note), "SetScreenActiveMode=%u, активный %d (%u Гц), VSync период %.2f мс (ожидалось %.2f)",
+                 ret, now.GetScreenModeId(), now.GetScreenRefreshRate(), period, expect);
+        Report("режимы: переключение на " + std::to_string(m.GetScreenRefreshRate()) + " Гц",
+               now.GetScreenModeId() == m.GetScreenModeId() && std::abs(period - expect) < 1.5, note);
+    }
+    rs.SetScreenActiveMode(g.screen, static_cast<uint32_t>(orig.GetScreenModeId()));
+    sleep(1);
+    MeasureVsync(1000, count, period);
+    snprintf(note, sizeof(note), "активный %d, VSync период %.2f мс",
+             rs.GetScreenActiveMode(g.screen).GetScreenModeId(), period);
+    Report("режимы: возврат к исходному", std::abs(period - 1000.0 / std::max(1u, orig.GetScreenRefreshRate())) < 1.5,
+           note);
+
+    // питание экрана: выключить, включить, VSync должен возобновиться
+    rs.SetScreenPowerStatus(g.screen, ScreenPowerStatus::POWER_STATUS_OFF);
+    sleep(2);
+    rs.SetScreenPowerStatus(g.screen, ScreenPowerStatus::POWER_STATUS_ON);
+    sleep(1);
+    MeasureVsync(1000, count, period);
+    snprintf(note, sizeof(note), "после включения: VSync %d сигналов за 1 с, период %.2f мс", count, period);
+    Report("питание: выключение и включение экрана", count > 20, note);
+}
+
 // ----------------------------------------------------------------------------- инициализация
 bool Setup()
 {
@@ -830,9 +1111,13 @@ int main(int argc, char **argv)
         {"screen", TestScreen}, {"colors", TestColors}, {"windows", TestWindows},
         {"shapes", TestShapes}, {"text", TestText}, {"cpubuffer", TestCpuBuffer},
         {"vsync", TestVsync}, {"perf", TestPerf}, {"stress", TestStress}, {"single", TestSingle},
+        {"transform", TestTransform}, {"decor", TestDecor}, {"blur", TestBlur}, {"image", TestImage},
+        {"animation", TestAnimation}, {"modes", TestModes},
     };
-    const std::vector<std::string> order = {"screen", "colors", "windows", "shapes", "text",
-                                            "cpubuffer", "vsync", "perf", "stress"};
+    // single и modes в общий прогон не входят: диагностика и смена состояния оборудования
+    const std::vector<std::string> order = {"screen", "colors", "windows", "shapes", "text", "cpubuffer",
+                                            "transform", "decor", "blur", "image", "animation",
+                                            "vsync", "perf", "stress"};
     std::vector<std::string> selected;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
